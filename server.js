@@ -24,11 +24,66 @@ app.get('/health', (req, res) => {
   res.json({ status: 'Backend is running!', abstractApiConfigured: !!ABSTRACT_API_KEY });
 });
 
+// ============ SMART CSV PARSER ============
+function extractEmailsFromCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length === 0) return [];
+
+  // Parse header row
+  const headerLine = lines[0];
+  const headers = headerLine.split(',').map(h => h.trim().toLowerCase());
+  
+  // Find email column index
+  let emailColumnIndex = headers.findIndex(h => h.includes('email'));
+  
+  // If no email column found, try to find any column with @ symbol
+  if (emailColumnIndex === -1) {
+    // Try second pass - look for emails in the data itself
+    for (let i = 1; i < Math.min(5, lines.length); i++) {
+      const parts = lines[i].split(',');
+      for (let j = 0; j < parts.length; j++) {
+        if (parts[j].includes('@')) {
+          emailColumnIndex = j;
+          break;
+        }
+      }
+      if (emailColumnIndex !== -1) break;
+    }
+  }
+
+  const emails = [];
+
+  // Extract emails from the identified column
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const parts = line.split(',');
+    
+    if (emailColumnIndex !== -1 && emailColumnIndex < parts.length) {
+      const email = parts[emailColumnIndex].trim().toLowerCase();
+      if (email && email.includes('@')) {
+        emails.push(email);
+      }
+    } else {
+      // Fallback: look for @ in any column
+      for (let j = 0; j < parts.length; j++) {
+        const part = parts[j].trim().toLowerCase();
+        if (part && part.includes('@')) {
+          emails.push(part);
+          break;
+        }
+      }
+    }
+  }
+
+  return emails;
+}
+
 // ============ EMAIL VALIDATION WITH ABSTRACT API ============
 async function validateEmailWithAbstract(email) {
   try {
     if (!ABSTRACT_API_KEY) {
-      // Fallback: basic validation without API
       return validateEmailFormat(email);
     }
 
@@ -50,7 +105,6 @@ async function validateEmailWithAbstract(email) {
     };
   } catch (error) {
     console.error(`Error validating ${email}:`, error.message);
-    // Fallback to format validation
     return validateEmailFormat(email);
   }
 }
@@ -78,7 +132,6 @@ app.post('/auth/register', async (req, res) => {
     return res.status(400).json({ error: 'Missing fields' });
   }
   
-  // Check if user exists
   if (users.find(u => u.email === email)) {
     return res.status(400).json({ error: 'User already exists' });
   }
@@ -139,8 +192,22 @@ app.get('/api/lists', (req, res) => {
 app.post('/api/lists/upload', async (req, res) => {
   const { listName, emails } = req.body;
   
-  if (!listName || !emails || !Array.isArray(emails)) {
-    return res.status(400).json({ error: 'Missing listName or emails array' });
+  if (!listName) {
+    return res.status(400).json({ error: 'Missing listName' });
+  }
+
+  let emailsToValidate = [];
+
+  // If emails array provided, use it
+  if (emails && Array.isArray(emails)) {
+    emailsToValidate = emails;
+  } else if (emails && typeof emails === 'string') {
+    // If emails is a CSV string, parse it
+    emailsToValidate = extractEmailsFromCSV(emails);
+  }
+
+  if (emailsToValidate.length === 0) {
+    return res.status(400).json({ error: 'No valid emails found' });
   }
 
   try {
@@ -149,7 +216,7 @@ app.post('/api/lists/upload', async (req, res) => {
     let validCount = 0;
     let invalidCount = 0;
 
-    for (const email of emails) {
+    for (const email of emailsToValidate) {
       const result = await validateEmailWithAbstract(email);
       validationResults.push(result);
       
@@ -164,10 +231,10 @@ app.post('/api/lists/upload', async (req, res) => {
       id: lists.length + 1,
       name: listName,
       status: 'completed',
-      total_emails: emails.length,
+      total_emails: emailsToValidate.length,
       valid_emails: validCount,
       invalid_emails: invalidCount,
-      validity_rate: emails.length > 0 ? Math.round((validCount / emails.length) * 100) : 0,
+      validity_rate: emailsToValidate.length > 0 ? Math.round((validCount / emailsToValidate.length) * 100) : 0,
       validationDetails: validationResults,
       createdAt: new Date()
     };
@@ -261,7 +328,6 @@ app.post('/api/campaigns/:id/send', (req, res) => {
     return res.status(404).json({ error: 'List not found' });
   }
   
-  // Update campaign status
   campaign.status = 'sent';
   campaign.total_sent = list.valid_emails;
   
