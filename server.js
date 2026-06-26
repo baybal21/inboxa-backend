@@ -3,21 +3,27 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
+const nodemailer = require('nodemailer');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const ABSTRACT_API_KEY = process.env.ABSTRACT_API_KEY || '';
+const BASE_URL = process.env.BASE_URL || 'https://inboxa-api.onrender.com';
 
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb' }));
 
 // Mock database (in-memory for demo)
 const users = [];
 const lists = [];
 const campaigns = [];
+const smtpConfigs = {};
+const emailEvents = []; // Track opens and clicks
 
 // Health check
 app.get('/health', (req, res) => {
@@ -29,21 +35,17 @@ function extractEmailsFromCSV(text) {
   const lines = text.trim().split('\n');
   if (lines.length === 0) return [];
 
-  // Detect delimiter (comma or tab)
   const firstLine = lines[0];
   const hasTab = firstLine.includes('\t');
   const delimiter = hasTab ? '\t' : ',';
 
-  // Parse header row
   const headerLine = lines[0];
-  const headers = headerLine.split(delimiter).map(h => 
+  const headers = headerLine.split(delimiter).map(h =>
     h.trim().toLowerCase().replace(/"/g, '').replace(/'/g, '')
   );
 
-  // Find email column index
   let emailColumnIndex = headers.findIndex(h => h.includes('email'));
 
-  // If no email column found, search data for @ symbol
   if (emailColumnIndex === -1) {
     for (let i = 1; i < Math.min(5, lines.length); i++) {
       const parts = lines[i].split(delimiter);
@@ -60,19 +62,16 @@ function extractEmailsFromCSV(text) {
 
   const emails = [];
 
-  // Extract emails from the identified column
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
     const parts = line.split(delimiter);
-
     let email = null;
 
     if (emailColumnIndex !== -1 && emailColumnIndex < parts.length) {
       email = cleanEmail(parts[emailColumnIndex]);
     } else {
-      // Fallback: look for @ in any column
       for (let j = 0; j < parts.length; j++) {
         const cleaned = cleanEmail(parts[j]);
         if (cleaned && cleaned.includes('@')) {
@@ -90,7 +89,6 @@ function extractEmailsFromCSV(text) {
   return emails;
 }
 
-// Clean email: remove quotes, spaces, etc.
 function cleanEmail(str) {
   if (!str) return '';
   return str
@@ -101,7 +99,6 @@ function cleanEmail(str) {
     .replace(/\s/g, '');
 }
 
-// Basic email format validation
 function isValidEmailFormat(email) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(email);
@@ -137,7 +134,6 @@ async function validateEmailWithAbstract(email) {
   }
 }
 
-// Basic email format validation (fallback)
 function validateEmailFormat(email) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const isValid = emailRegex.test(email);
@@ -150,6 +146,19 @@ function validateEmailFormat(email) {
     deliverability: isValid ? 'DELIVERABLE' : 'UNDELIVERABLE',
     status: isValid ? 'valid' : 'invalid'
   };
+}
+
+// ============ NODEMAILER SETUP ============
+function createTransporter(smtpConfig) {
+  return nodemailer.createTransport({
+    host: smtpConfig.smtpHost,
+    port: smtpConfig.smtpPort,
+    secure: smtpConfig.smtpPort === 465,
+    auth: {
+      user: smtpConfig.smtpUser,
+      pass: smtpConfig.smtpPassword
+    }
+  });
 }
 
 // ============ AUTH ROUTES ============
@@ -165,8 +174,10 @@ app.post('/auth/register', async (req, res) => {
   }
 
   const hashedPassword = await bcrypt.hash(password, 10);
+  const userId = users.length + 1;
+  
   users.push({
-    id: users.length + 1,
+    id: userId,
     email,
     password: hashedPassword,
     company,
@@ -200,12 +211,13 @@ app.post('/auth/login', async (req, res) => {
 app.get('/api/dashboard', (req, res) => {
   const totalValidEmails = lists.reduce((sum, list) => sum + (list.valid_emails || 0), 0);
   const totalEmails = lists.reduce((sum, list) => sum + (list.total_emails || 0), 0);
+  const totalEmailsSent = campaigns.reduce((sum, camp) => sum + (camp.total_sent || 0), 0);
 
   res.json({
     totalLists: lists.length,
     totalContacts: totalEmails,
     totalCampaigns: campaigns.length,
-    emailsSent: 0,
+    emailsSent: totalEmailsSent,
     validEmails: totalValidEmails,
     openRate: 0,
     validityRate: totalEmails > 0 ? Math.round((totalValidEmails / totalEmails) * 100) : 0
@@ -226,11 +238,9 @@ app.post('/api/lists/upload', async (req, res) => {
 
   let emailsToValidate = [];
 
-  // If emails array provided, use it
   if (emails && Array.isArray(emails)) {
     emailsToValidate = emails;
   } else if (emails && typeof emails === 'string') {
-    // If emails is a CSV string, parse it
     emailsToValidate = extractEmailsFromCSV(emails);
   }
 
@@ -239,7 +249,6 @@ app.post('/api/lists/upload', async (req, res) => {
   }
 
   try {
-    // Validate all emails with Abstract API
     const validationResults = [];
     let validCount = 0;
     let invalidCount = 0;
@@ -283,29 +292,55 @@ app.post('/api/lists/upload', async (req, res) => {
   }
 });
 
-// ============ SENDER CONFIG ============
+// ============ SENDER CONFIG (ESP SETUP) ============
 app.get('/api/sender-config', (req, res) => {
-  res.json({
-    smtpHost: 'smtp.gmail.com',
-    smtpPort: 587,
-    smtpUser: '',
-    smtpPassword: '',
-    fromEmail: '',
-    fromName: ''
-  });
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const config = smtpConfigs[decoded.id] || {
+      smtpHost: '',
+      smtpPort: 587,
+      smtpUser: '',
+      smtpPassword: '',
+      fromEmail: '',
+      fromName: ''
+    };
+    res.json(config);
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
 });
 
 app.post('/api/sender-config', (req, res) => {
-  const { smtpHost, smtpPort, smtpUser, smtpPassword, fromEmail, fromName } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
-  if (!smtpHost || !smtpUser || !smtpPassword || !fromEmail) {
-    return res.status(400).json({ error: 'Missing required SMTP fields' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { smtpHost, smtpPort, smtpUser, smtpPassword, fromEmail, fromName } = req.body;
+
+    if (!smtpHost || !smtpUser || !smtpPassword || !fromEmail) {
+      return res.status(400).json({ error: 'Missing required SMTP fields' });
+    }
+
+    smtpConfigs[decoded.id] = {
+      smtpHost,
+      smtpPort: parseInt(smtpPort),
+      smtpUser,
+      smtpPassword,
+      fromEmail,
+      fromName
+    };
+
+    res.json({
+      message: 'Config saved successfully',
+      config: smtpConfigs[decoded.id]
+    });
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
   }
-
-  res.json({
-    message: 'Config saved successfully',
-    config: { smtpHost, smtpPort, smtpUser, fromEmail, fromName }
-  });
 });
 
 // ============ CAMPAIGNS ============
@@ -320,6 +355,7 @@ app.post('/api/campaigns', (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
+  const trackingId = uuidv4();
   const newCampaign = {
     id: campaigns.length + 1,
     name,
@@ -332,6 +368,7 @@ app.post('/api/campaigns', (req, res) => {
     total_sent: 0,
     opened: 0,
     clicked: 0,
+    trackingId,
     createdAt: new Date()
   };
 
@@ -343,7 +380,7 @@ app.post('/api/campaigns', (req, res) => {
   });
 });
 
-app.post('/api/campaigns/:id/send', (req, res) => {
+app.post('/api/campaigns/:id/send', async (req, res) => {
   const campaignId = parseInt(req.params.id);
   const campaign = campaigns.find(c => c.id === campaignId);
 
@@ -356,14 +393,92 @@ app.post('/api/campaigns/:id/send', (req, res) => {
     return res.status(404).json({ error: 'List not found' });
   }
 
-  campaign.status = 'sent';
-  campaign.total_sent = list.valid_emails;
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
-  res.json({
-    message: 'Campaign sent successfully',
-    sentCount: list.valid_emails,
-    campaign: campaign
-  });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const smtpConfig = smtpConfigs[decoded.id];
+
+    if (!smtpConfig) {
+      return res.status(400).json({ error: 'SMTP not configured. Setup ESP first.' });
+    }
+
+    const transporter = createTransporter(smtpConfig);
+
+    // Get valid emails from list
+    const validEmails = list.validationDetails
+      ?.filter(v => v.status === 'valid')
+      .map(v => v.email) || [];
+
+    if (validEmails.length === 0) {
+      return res.status(400).json({ error: 'No valid emails in list' });
+    }
+
+    let sentCount = 0;
+    const errors = [];
+
+    // Send emails
+    for (const email of validEmails) {
+      try {
+        // Add tracking pixel
+        const trackingPixel = `<img src="${BASE_URL}/api/track/open/${campaign.trackingId}/${Buffer.from(email).toString('base64')}" width="1" height="1" />`;
+        const htmlWithTracking = campaign.htmlContent + trackingPixel;
+
+        await transporter.sendMail({
+          from: `${smtpConfig.fromName} <${smtpConfig.fromEmail}>`,
+          to: email,
+          subject: campaign.subject,
+          html: htmlWithTracking
+        });
+
+        sentCount++;
+      } catch (err) {
+        console.error(`Failed to send to ${email}:`, err.message);
+        errors.push(email);
+      }
+    }
+
+    campaign.status = 'sent';
+    campaign.total_sent = sentCount;
+
+    res.json({
+      message: `Campaign sent to ${sentCount} emails`,
+      sentCount,
+      failedCount: errors.length,
+      campaign: campaign
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send campaign', details: err.message });
+  }
+});
+
+// ============ TRACKING ============
+// Track email opens
+app.get('/api/track/open/:campaignId/:emailEncoded', (req, res) => {
+  try {
+    const { campaignId, emailEncoded } = req.params;
+    const email = Buffer.from(emailEncoded, 'base64').toString('utf-8');
+    const campaign = campaigns.find(c => c.id === parseInt(campaignId));
+
+    if (campaign) {
+      campaign.opened = (campaign.opened || 0) + 1;
+      emailEvents.push({
+        campaignId,
+        email,
+        event: 'open',
+        timestamp: new Date()
+      });
+    }
+
+    // Return transparent pixel
+    const pixel = Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x21, 0xF9, 0x04, 0x01, 0x0A, 0x00, 0x01, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x4C, 0x01, 0x00, 0x3B]);
+    res.contentType('image/gif');
+    res.send(pixel);
+  } catch (err) {
+    console.error('Tracking error:', err);
+    res.status(500).send('');
+  }
 });
 
 app.get('/api/campaigns/:id/analytics', (req, res) => {
@@ -394,4 +509,5 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
   console.log(`📧 Abstract API: ${ABSTRACT_API_KEY ? 'Connected ✅' : 'Not configured ⚠️'}`);
+  console.log(`📨 Email Sending: Nodemailer Ready ✅`);
 });
