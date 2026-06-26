@@ -24,25 +24,32 @@ app.get('/health', (req, res) => {
   res.json({ status: 'Backend is running!', abstractApiConfigured: !!ABSTRACT_API_KEY });
 });
 
-// ============ SMART CSV PARSER ============
+// ============ ULTRA-ROBUST CSV PARSER ============
 function extractEmailsFromCSV(text) {
   const lines = text.trim().split('\n');
   if (lines.length === 0) return [];
 
+  // Detect delimiter (comma or tab)
+  const firstLine = lines[0];
+  const hasTab = firstLine.includes('\t');
+  const delimiter = hasTab ? '\t' : ',';
+
   // Parse header row
   const headerLine = lines[0];
-  const headers = headerLine.split(',').map(h => h.trim().toLowerCase());
-  
+  const headers = headerLine.split(delimiter).map(h => 
+    h.trim().toLowerCase().replace(/"/g, '').replace(/'/g, '')
+  );
+
   // Find email column index
   let emailColumnIndex = headers.findIndex(h => h.includes('email'));
-  
-  // If no email column found, try to find any column with @ symbol
+
+  // If no email column found, search data for @ symbol
   if (emailColumnIndex === -1) {
-    // Try second pass - look for emails in the data itself
     for (let i = 1; i < Math.min(5, lines.length); i++) {
-      const parts = lines[i].split(',');
+      const parts = lines[i].split(delimiter);
       for (let j = 0; j < parts.length; j++) {
-        if (parts[j].includes('@')) {
+        const cleaned = cleanEmail(parts[j]);
+        if (cleaned && cleaned.includes('@')) {
           emailColumnIndex = j;
           break;
         }
@@ -58,26 +65,46 @@ function extractEmailsFromCSV(text) {
     const line = lines[i].trim();
     if (!line) continue;
 
-    const parts = line.split(',');
-    
+    const parts = line.split(delimiter);
+
+    let email = null;
+
     if (emailColumnIndex !== -1 && emailColumnIndex < parts.length) {
-      const email = parts[emailColumnIndex].trim().toLowerCase();
-      if (email && email.includes('@')) {
-        emails.push(email);
-      }
+      email = cleanEmail(parts[emailColumnIndex]);
     } else {
       // Fallback: look for @ in any column
       for (let j = 0; j < parts.length; j++) {
-        const part = parts[j].trim().toLowerCase();
-        if (part && part.includes('@')) {
-          emails.push(part);
+        const cleaned = cleanEmail(parts[j]);
+        if (cleaned && cleaned.includes('@')) {
+          email = cleaned;
           break;
         }
       }
     }
+
+    if (email && email.includes('@') && isValidEmailFormat(email)) {
+      emails.push(email);
+    }
   }
 
   return emails;
+}
+
+// Clean email: remove quotes, spaces, etc.
+function cleanEmail(str) {
+  if (!str) return '';
+  return str
+    .trim()
+    .toLowerCase()
+    .replace(/^["']/, '')
+    .replace(/["']$/, '')
+    .replace(/\s/g, '');
+}
+
+// Basic email format validation
+function isValidEmailFormat(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
 }
 
 // ============ EMAIL VALIDATION WITH ABSTRACT API ============
@@ -91,7 +118,8 @@ async function validateEmailWithAbstract(email) {
       params: {
         api_key: ABSTRACT_API_KEY,
         email: email
-      }
+      },
+      timeout: 5000
     });
 
     const data = response.data;
@@ -113,7 +141,7 @@ async function validateEmailWithAbstract(email) {
 function validateEmailFormat(email) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const isValid = emailRegex.test(email);
-  
+
   return {
     email: email,
     is_valid_format: isValid,
@@ -127,44 +155,44 @@ function validateEmailFormat(email) {
 // ============ AUTH ROUTES ============
 app.post('/auth/register', async (req, res) => {
   const { email, password, company } = req.body;
-  
+
   if (!email || !password || !company) {
     return res.status(400).json({ error: 'Missing fields' });
   }
-  
+
   if (users.find(u => u.email === email)) {
     return res.status(400).json({ error: 'User already exists' });
   }
-  
+
   const hashedPassword = await bcrypt.hash(password, 10);
-  users.push({ 
-    id: users.length + 1, 
-    email, 
-    password: hashedPassword, 
+  users.push({
+    id: users.length + 1,
+    email,
+    password: hashedPassword,
     company,
     createdAt: new Date()
   });
-  
+
   res.json({ message: 'User registered successfully', email });
 });
 
 app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
-  
+
   const user = users.find(u => u.email === email);
   if (!user) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
-  
+
   const validPassword = await bcrypt.compare(password, user.password);
   if (!validPassword) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
-  
+
   const token = jwt.sign({ id: user.id, email }, JWT_SECRET);
-  res.json({ 
-    token, 
-    user: { id: user.id, email, company: user.company } 
+  res.json({
+    token,
+    user: { id: user.id, email, company: user.company }
   });
 });
 
@@ -172,7 +200,7 @@ app.post('/auth/login', async (req, res) => {
 app.get('/api/dashboard', (req, res) => {
   const totalValidEmails = lists.reduce((sum, list) => sum + (list.valid_emails || 0), 0);
   const totalEmails = lists.reduce((sum, list) => sum + (list.total_emails || 0), 0);
-  
+
   res.json({
     totalLists: lists.length,
     totalContacts: totalEmails,
@@ -191,7 +219,7 @@ app.get('/api/lists', (req, res) => {
 
 app.post('/api/lists/upload', async (req, res) => {
   const { listName, emails } = req.body;
-  
+
   if (!listName) {
     return res.status(400).json({ error: 'Missing listName' });
   }
@@ -207,7 +235,7 @@ app.post('/api/lists/upload', async (req, res) => {
   }
 
   if (emailsToValidate.length === 0) {
-    return res.status(400).json({ error: 'No valid emails found' });
+    return res.status(400).json({ error: 'No valid emails found in file' });
   }
 
   try {
@@ -219,7 +247,7 @@ app.post('/api/lists/upload', async (req, res) => {
     for (const email of emailsToValidate) {
       const result = await validateEmailWithAbstract(email);
       validationResults.push(result);
-      
+
       if (result.status === 'valid') {
         validCount++;
       } else {
@@ -238,11 +266,11 @@ app.post('/api/lists/upload', async (req, res) => {
       validationDetails: validationResults,
       createdAt: new Date()
     };
-    
+
     lists.push(newList);
-    
-    res.json({ 
-      listId: newList.id, 
+
+    res.json({
+      listId: newList.id,
       message: 'List uploaded and validated',
       total_emails: newList.total_emails,
       valid_emails: newList.valid_emails,
@@ -269,12 +297,12 @@ app.get('/api/sender-config', (req, res) => {
 
 app.post('/api/sender-config', (req, res) => {
   const { smtpHost, smtpPort, smtpUser, smtpPassword, fromEmail, fromName } = req.body;
-  
+
   if (!smtpHost || !smtpUser || !smtpPassword || !fromEmail) {
     return res.status(400).json({ error: 'Missing required SMTP fields' });
   }
-  
-  res.json({ 
+
+  res.json({
     message: 'Config saved successfully',
     config: { smtpHost, smtpPort, smtpUser, fromEmail, fromName }
   });
@@ -287,11 +315,11 @@ app.get('/api/campaigns', (req, res) => {
 
 app.post('/api/campaigns', (req, res) => {
   const { name, subject, htmlContent, listId, fromEmail, fromName } = req.body;
-  
+
   if (!name || !subject || !listId) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
-  
+
   const newCampaign = {
     id: campaigns.length + 1,
     name,
@@ -306,9 +334,9 @@ app.post('/api/campaigns', (req, res) => {
     clicked: 0,
     createdAt: new Date()
   };
-  
+
   campaigns.push(newCampaign);
-  res.json({ 
+  res.json({
     campaignId: newCampaign.id,
     message: 'Campaign created',
     campaign: newCampaign
@@ -318,20 +346,20 @@ app.post('/api/campaigns', (req, res) => {
 app.post('/api/campaigns/:id/send', (req, res) => {
   const campaignId = parseInt(req.params.id);
   const campaign = campaigns.find(c => c.id === campaignId);
-  
+
   if (!campaign) {
     return res.status(404).json({ error: 'Campaign not found' });
   }
-  
+
   const list = lists.find(l => l.id === campaign.listId);
   if (!list) {
     return res.status(404).json({ error: 'List not found' });
   }
-  
+
   campaign.status = 'sent';
   campaign.total_sent = list.valid_emails;
-  
-  res.json({ 
+
+  res.json({
     message: 'Campaign sent successfully',
     sentCount: list.valid_emails,
     campaign: campaign
@@ -341,11 +369,11 @@ app.post('/api/campaigns/:id/send', (req, res) => {
 app.get('/api/campaigns/:id/analytics', (req, res) => {
   const campaignId = parseInt(req.params.id);
   const campaign = campaigns.find(c => c.id === campaignId);
-  
+
   if (!campaign) {
     return res.status(404).json({ error: 'Campaign not found' });
   }
-  
+
   res.json({
     sent: campaign.total_sent || 0,
     opened: campaign.opened || 0,
