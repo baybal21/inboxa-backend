@@ -194,9 +194,8 @@ function isValidEmailFormat(email) {
   return emailRegex.test(email);
 }
 
-// ============ EMAIL VALIDATION ============
+// Email validation - skip Abstract API, use basic format only
 async function validateEmailWithAbstract(email) {
-  // Skip Abstract API - use basic format validation only
   return validateEmailFormat(email);
 }
 
