@@ -196,10 +196,9 @@ function isValidEmailFormat(email) {
 
 // ============ EMAIL VALIDATION ============
 async function validateEmailWithAbstract(email) {
-  try {
-    if (!ABSTRACT_API_KEY) {
-      return validateEmailFormat(email);
-    }
+  // Skip Abstract API - use basic format validation only
+  return validateEmailFormat(email);
+}
 
     const response = await axios.get('https://emailvalidation.abstractapi.com/v1/', {
       params: {
